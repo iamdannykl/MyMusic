@@ -6,6 +6,8 @@ export interface MusicFile {
   name: string
   artist: string
   duration?: number
+  coverPath?: string
+  lyricsPath?: string
 }
 
 export type PlayMode = 'listLoop' | 'singleLoop' | 'shuffle'
@@ -13,6 +15,16 @@ export type PlayMode = 'listLoop' | 'singleLoop' | 'shuffle'
 declare global {
   interface Window {
     showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>
+  }
+  
+  interface FileSystemDirectoryHandle {
+    values(): AsyncIterableIterator<FileSystemHandle>
+    queryPermission(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
+    requestPermission(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
+  }
+  
+  interface FileSystemHandlePermissionDescriptor {
+    mode?: 'read' | 'readwrite'
   }
 }
 
@@ -85,20 +97,41 @@ async function loadDirHandle(): Promise<FileSystemDirectoryHandle | null> {
 async function getMusicFilesFromDirectory(dirHandle: FileSystemDirectoryHandle): Promise<MusicFile[]> {
   const musicFiles: MusicFile[] = []
   const allowedExtensions = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac']
-
+  const imageExtensions = ['jpg', 'jpeg', 'png', 'webp', 'gif']
+  
+  // 首先收集所有文件
+  const allFiles: { name: string; baseName: string; ext: string }[] = []
+  
   try {
     for await (const entry of dirHandle.values()) {
       if (entry.kind === 'file') {
         const ext = entry.name.split('.').pop()?.toLowerCase() || ''
-        if (allowedExtensions.includes(ext)) {
-          const name = entry.name.replace(/\.[^/.]+$/, '')
-          musicFiles.push({
-            path: entry.name,
-            name,
-            artist: 'Unknown Artist',
-            duration: undefined,
-          })
-        }
+        const baseName = entry.name.replace(/\.[^/.]+$/, '')
+        allFiles.push({ name: entry.name, baseName, ext })
+      }
+    }
+    
+    // 处理音乐文件并查找对应的封面和歌词
+    for (const file of allFiles) {
+      if (allowedExtensions.includes(file.ext)) {
+        // 查找同名封面
+        const coverFile = allFiles.find(
+          f => f.baseName === file.baseName && imageExtensions.includes(f.ext)
+        )
+        
+        // 查找同名歌词
+        const lyricsFile = allFiles.find(
+          f => f.baseName === file.baseName && f.ext === 'lrc'
+        )
+        
+        musicFiles.push({
+          path: file.name,
+          name: file.baseName,
+          artist: 'Unknown Artist',
+          duration: undefined,
+          coverPath: coverFile?.name,
+          lyricsPath: lyricsFile?.name,
+        })
       }
     }
   } catch (error) {
@@ -107,6 +140,35 @@ async function getMusicFilesFromDirectory(dirHandle: FileSystemDirectoryHandle):
 
   musicFiles.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
   return musicFiles
+}
+
+// LRC 歌词解析
+interface LyricLine {
+  time: number
+  text: string
+}
+
+function parseLRC(lrcContent: string): LyricLine[] {
+  const lines = lrcContent.split('\n')
+  const lyrics: LyricLine[] = []
+  
+  for (const line of lines) {
+    // 匹配 [mm:ss.xx] 或 [mm:ss] 格式
+    const matches = line.match(/\[(\d{2}):(\d{2})\.?(\d{2,3})?\](.*)/);
+    if (matches) {
+      const minutes = parseInt(matches[1])
+      const seconds = parseInt(matches[2])
+      const milliseconds = matches[3] ? parseInt(matches[3].padEnd(3, '0')) : 0
+      const time = minutes * 60 + seconds + milliseconds / 1000
+      const text = matches[4].trim()
+      
+      if (text) { // 只添加有文本的行
+        lyrics.push({ time, text })
+      }
+    }
+  }
+  
+  return lyrics.sort((a, b) => a.time - b.time)
 }
 
 function App() {
@@ -122,9 +184,13 @@ function App() {
   const [shuffledIndices, setShuffledIndices] = useState<number[]>([])
   const [shufflePosition, setShufflePosition] = useState<number>(0)
   const [isInitializing, setIsInitializing] = useState<boolean>(true)
+  const [coverUrl, setCoverUrl] = useState<string>('')
+  const [lyrics, setLyrics] = useState<LyricLine[]>([])
+  const [currentLyricIndex, setCurrentLyricIndex] = useState<number>(-1)
   
   const audioRef = useRef<HTMLAudioElement>(null)
   const isAudioLoading = useRef<boolean>(false)
+  const lyricsRef = useRef<HTMLDivElement>(null)
 
   const currentSong = musicFiles[currentSongIndex]
 
@@ -137,7 +203,7 @@ function App() {
       const handles = new Map<string, FileSystemFileHandle>()
       for await (const entry of dirHandle.values()) {
         if (entry.kind === 'file') {
-          handles.set(entry.name, entry)
+          handles.set(entry.name, entry as FileSystemFileHandle)
         }
       }
       setFileHandles(handles)
@@ -214,13 +280,57 @@ function App() {
     return ''
   }
 
+  const loadCover = async (song: MusicFile) => {
+    if (song.coverPath) {
+      const fileHandle = fileHandles.get(song.coverPath)
+      if (fileHandle) {
+        try {
+          const file = await fileHandle.getFile()
+          const url = URL.createObjectURL(file)
+          setCoverUrl(url)
+          return
+        } catch (error) {
+          console.error('Failed to load cover:', error)
+        }
+      }
+    }
+    setCoverUrl('') // 没有封面
+  }
+
+  const loadLyrics = async (song: MusicFile) => {
+    if (song.lyricsPath) {
+      const fileHandle = fileHandles.get(song.lyricsPath)
+      if (fileHandle) {
+        try {
+          const file = await fileHandle.getFile()
+          const text = await file.text()
+          const parsedLyrics = parseLRC(text)
+          setLyrics(parsedLyrics)
+          setCurrentLyricIndex(-1)
+          return
+        } catch (error) {
+          console.error('Failed to load lyrics:', error)
+        }
+      }
+    }
+    setLyrics([]) // 没有歌词
+    setCurrentLyricIndex(-1)
+  }
+
   const loadAndPlaySong = async (index: number) => {
     if (index < 0 || index >= musicFiles.length) return
     
     isAudioLoading.current = true
     setCurrentSongIndex(index)
     const song = musicFiles[index]
-    const url = await getAudioUrl(song)
+    
+    // 并行加载音频、封面和歌词
+    const [url] = await Promise.all([
+      getAudioUrl(song),
+      loadCover(song),
+      loadLyrics(song)
+    ])
+    
     setAudioUrl(url)
     
     if (audioRef.current) {
@@ -327,10 +437,38 @@ function App() {
 
   const handleTimeUpdate = () => {
     if (audioRef.current) {
-      setCurrentTime(audioRef.current.currentTime)
+      const time = audioRef.current.currentTime
+      setCurrentTime(time)
       setDuration(audioRef.current.duration || 0)
+      
+      // 更新当前歌词索引
+      if (lyrics.length > 0) {
+        let newIndex = -1
+        for (let i = lyrics.length - 1; i >= 0; i--) {
+          if (time >= lyrics[i].time) {
+            newIndex = i
+            break
+          }
+        }
+        if (newIndex !== currentLyricIndex) {
+          setCurrentLyricIndex(newIndex)
+        }
+      }
     }
   }
+
+  // 自动滚动歌词
+  useEffect(() => {
+    if (lyricsRef.current && currentLyricIndex >= 0) {
+      const lyricElements = lyricsRef.current.children
+      if (lyricElements[currentLyricIndex]) {
+        lyricElements[currentLyricIndex].scrollIntoView({
+          behavior: 'smooth',
+          block: 'center'
+        })
+      }
+    }
+  }, [currentLyricIndex])
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value)
@@ -459,11 +597,15 @@ function App() {
               <>
                 <div className="player-header">
                   <div className="cover-art">
-                    <div className="cover-placeholder">
-                      <svg viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-                      </svg>
-                    </div>
+                    {coverUrl ? (
+                      <img src={coverUrl} alt={currentSong.name} className="cover-image" />
+                    ) : (
+                      <div className="cover-placeholder">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+                        </svg>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -548,6 +690,24 @@ function App() {
                       </div>
                     </div>
                   </div>
+
+                  {/* 歌词显示 */}
+                  {lyrics.length > 0 && (
+                    <div className="lyrics-section">
+                      <div className="lyrics-container" ref={lyricsRef}>
+                        {lyrics.map((line, index) => (
+                          <div
+                            key={index}
+                            className={`lyric-line ${index === currentLyricIndex ? 'active' : ''} ${
+                              index < currentLyricIndex ? 'passed' : ''
+                            }`}
+                          >
+                            {line.text}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <audio
